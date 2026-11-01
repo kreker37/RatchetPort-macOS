@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd -- "$(dirname -- "$0")"
+mkdir -p out
+# Windows: MSYS2 CLANG64 (packages in packaging/windows/README.md). The GPU library is static
+# there and CMake links ratchet-probe.exe as well; no PGO (GCC-only flags), LTO off by default.
+case $(uname -s) in
+MINGW*|MSYS*)
+    # shellcheck source=msys2-env.sh
+    source ./msys2-env.sh
+    for tool in clang cmake ninja pkg-config; do
+        command -v "$tool" >/dev/null || { echo "Need $tool from MSYS2 CLANG64 (packaging/windows/README.md)." >&2; exit 1; }
+    done
+    if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ||
+          ! -f gpu/third_party/xbyak/xbyak/xbyak.h ]]; then
+        git submodule update --init --recursive
+    fi
+    for patch in gpu/patches/fsr-vulkan/*.patch; do
+        if git -C gpu/third_party/fsr-vulkan rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
+                git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
+            fi
+        elif ! patch -R --dry-run -s -p1 -d gpu/third_party/fsr-vulkan < "$PWD/$patch"; then
+            patch -s -p1 -d gpu/third_party/fsr-vulkan < "$PWD/$patch"
+        fi
+    done
+    build_dir=${RATCHET_BUILD_DIR:-out/ratchet-clean}
+    cmake -S gpu -B "$build_dir" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DRATCHET_PGO=off \
+        -DRATCHET_LTO="${RATCHET_LTO:-OFF}" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ >/dev/null
+    echo "GPU library and loader: LTO ${RATCHET_LTO:-OFF}"
+    if ! ninja -C "$build_dir" ratchet-probe ratchet-gpu-capabilities ratchet-play > out/gpu-build.log 2>&1; then
+        grep -v '^\[' out/gpu-build.log | tail -40 >&2
+        echo 'Build failed (full log: out/gpu-build.log)' >&2; exit 1
+    fi
+    cp "$build_dir"/ratchet-probe.exe "$build_dir"/ratchet-gpu-capabilities.exe "$build_dir"/ratchet-play.exe out/
+    echo "Built $PWD/out/ratchet-probe.exe"
+    exit 0
+    ;;
+Darwin)
+    # Apple Silicon: the runtime and PS4 guest execute as x86-64 under Rosetta 2.
+    deps=${RATCHET_MACOS_DEPS:-$PWD/work/macos-deps}
+    # Apple Silicon's Rosetta implementation supports the x86-64-v3 baseline. Keep this
+    # overridable for older Intel Macs or diagnosis; Release+LTO are the local performance build.
+    mac_march=${RATCHET_X86_MARCH:-x86-64-v3}
+    mac_build_type=${RATCHET_BUILD_TYPE:-Release}
+    if [[ ! -f $deps/.done-ffmpeg || ! -f $deps/.done-kosmickrisp ]]; then
+        bash packaging/macos/build-deps.sh
+    fi
+    export PKG_CONFIG_PATH="$deps/lib/pkgconfig"
+    CC=(clang -arch x86_64 -march="$mac_march" -mmacosx-version-min=14.0)
+    if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ||
+          ! -f third_party/LibAtrac9/C/src/libatrac9.h ]]; then
+        git submodule update --init --recursive
+    fi
+    for patch in gpu/patches/fsr-vulkan/*.patch; do
+        if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
+            git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
+        fi
+    done
+    cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE="$mac_build_type" \
+        -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_SYSTEM_PROCESSOR=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+        -DCMAKE_C_FLAGS="-march=$mac_march" -DCMAKE_CXX_FLAGS="-march=$mac_march" \
+        -DCMAKE_PREFIX_PATH="$deps;$(brew --prefix boost)" -DCMAKE_SHARED_LINKER_FLAGS="-L$deps/lib" \
+        -DCMAKE_EXE_LINKER_FLAGS="-L$deps/lib" -DRATCHET_PGO="${RATCHET_PGO:-off}" \
+        -DRATCHET_LTO="${RATCHET_LTO:-ON}" >/dev/null
+    if ! ninja -j"${CMAKE_BUILD_PARALLEL_LEVEL:-2}" -C out/gpu ratchetgpu > out/gpu-build.log 2>&1; then
+        grep -v '^\[' out/gpu-build.log | tail -60 >&2
+        echo 'GPU library build failed (full log: out/gpu-build.log)' >&2; exit 1
+    fi
+    read -r -a includes <<< "$(pkg-config --cflags vulkan sdl3 libavcodec libavutil libswscale libavformat libswresample)"
+    read -r -a libraries <<< "$(pkg-config --libs vulkan sdl3 libavcodec libavutil libswscale libavformat libswresample)"
+    gpu=(-Lout/gpu -lratchetgpu -Wl,-rpath,@executable_path/gpu -Wl,-rpath,"$deps/lib")
+    runtime=(src/runtime*.c src/compat_mac.c)
+    if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/libatrac9.a -name '*.c') ]]; then
+        rm -rf out/atrac9 && mkdir -p out/atrac9
+        for source in third_party/LibAtrac9/C/src/*.c; do
+            "${CC[@]}" -std=c99 -O3 -g -w -c "$source" -o "out/atrac9/$(basename "${source%.c}").o"
+        done
+        ar rcs out/libatrac9.a out/atrac9/*.o
+    fi
+    "${CC[@]}" -std=c11 -O3 -g -Wall -Wextra -Werror -mgeneral-regs-only -Isrc -c src/isa_emulate.c -o out/isa_emulate.o
+    "${CC[@]}" -std=c11 -O3 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc \
+        src/probe.c "${runtime[@]}" src/cpu_check.c src/vulkan_smoke.c out/isa_emulate.o src/isa_rewrite.c \
+        out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -Wl,-export_dynamic -o out/ratchet-probe
+    sed "s|\"library_path\": *\"[^\"]*\"|\"library_path\": \"$deps/lib/libvulkan_kosmickrisp.dylib\"|" \
+        "$deps/share/vulkan/icd.d/kosmickrisp_mesa_icd.json" > out/kosmickrisp_mesa_icd.json
+    "${CC[@]}" -std=c11 -O2 -Wall -Wextra -Werror -Igpu/shadps4 "${includes[@]}" tools/gpu_capabilities.c \
+        "${libraries[@]}" -o out/ratchet-gpu-capabilities
+    echo "Built $PWD/out/ratchet-probe for x86-64 under Rosetta 2"
+    exit 0
+    ;;
+esac
+if [[ -z ${CC:-} ]]; then
+    CC=$(command -v cc || command -v gcc || true)
+    if [[ -z $CC ]]; then
+        for candidate in /nix/store/*-gcc-wrapper-*/bin/gcc; do
+            if [[ -x $candidate ]]; then CC=$candidate; break; fi
+        done
+    fi
+fi
+if [[ -z ${CC:-} ]]; then echo 'Install GCC/Clang or set CC.' >&2; exit 1; fi
+# Dependencies come from pkg-config (Vulkan loader/headers, SDL3). On NixOS the
+# environment is provided by shell.nix; re-enter it automatically if needed.
+if ! { command -v pkg-config >/dev/null && pkg-config --exists vulkan sdl3 && command -v cmake >/dev/null && command -v ninja >/dev/null; }; then
+    if [[ -z ${RATCHET_IN_NIX_SHELL:-} ]] && command -v nix-shell >/dev/null; then
+        exec env RATCHET_IN_NIX_SHELL=1 nix-shell shell.nix --run "bash build.sh $*"
+    fi
+    echo 'Need pkg-config with vulkan and sdl3, cmake and ninja (see shell.nix).' >&2; exit 1
+fi
+read -r -a includes <<< "$(pkg-config --cflags vulkan sdl3 libavcodec libavutil libswscale)"
+read -r -a libraries <<< "$(pkg-config --libs vulkan sdl3 libavcodec libavutil libswscale)"
+# GPU library (shadPS4 video core + drivers), built by CMake into out/gpu/libratchetgpu.so.
+# RATCHET_PGO: generate (instrumented build that writes pgo/ while the game runs), use, off.
+# Default: use the profile in pgo/ when there is one. RATCHET_LTO=OFF disables link-time optimization.
+pgo=${RATCHET_PGO:-}
+if [[ -z $pgo ]]; then
+    if [[ -n $(find pgo -name '*.gcda' -print -quit 2>/dev/null) ]]; then pgo=use; else pgo=off; fi
+fi
+mkdir -p pgo
+# Submodules (git clone --recursive, or: git submodule update --init) and this port's changes
+# to FSR-Vulkan (gpu/patches/fsr-vulkan), applied to its working tree once.
+if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ]]; then
+    git submodule update --init --recursive
+fi
+for patch in gpu/patches/fsr-vulkan/*.patch; do
+    if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
+        git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
+    fi
+done
+cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DRATCHET_PGO="$pgo" \
+    -DRATCHET_LTO="${RATCHET_LTO:-ON}" -DRATCHET_PGO_DIR="$PWD/pgo" >/dev/null
+echo "GPU library: PGO $pgo, LTO ${RATCHET_LTO:-ON}"
+# A failed GPU build must stop here: an older libratchetgpu.so would otherwise be used silently.
+if ! ninja -C out/gpu ratchetgpu > out/gpu-build.log 2>&1; then
+    grep -v '^\[' out/gpu-build.log | tail -40 >&2
+    echo 'GPU library build failed (full log: out/gpu-build.log)' >&2; exit 1
+fi
+# $ORIGIN/gpu: packaged copies keep the library next to the binary without patching it.
+gpu=(-Lout/gpu -lratchetgpu -Wl,-rpath,'$ORIGIN/gpu' -Wl,-rpath,"$PWD/out/gpu" -rdynamic)
+runtime=(src/runtime*.c)
+# Third-party decoders: compiled once, without this project's -Werror policy.
+atrac9=(third_party/LibAtrac9/C/src/*.c)
+if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/libatrac9.a -name '*.c') ]]; then
+    rm -rf out/atrac9 && mkdir -p out/atrac9
+    for source in "${atrac9[@]}"; do "$CC" -std=c99 -O2 -g -w -c "$source" -o "out/atrac9/$(basename "${source%.c}").o"; done
+    ar rcs out/libatrac9.a out/atrac9/*.o
+fi
+# isa_emulate runs inside guest code: no XMM/YMM.
+"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -mgeneral-regs-only -c src/isa_emulate.c -o out/isa_emulate.o
+"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/cpu_check.c src/vulkan_smoke.c out/isa_emulate.o src/isa_rewrite.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/ratchet-probe
+echo "Built $PWD/out/ratchet-probe"
+# GPU check for run.sh (live_resolution=auto): links only the Vulkan loader.
+"$CC" -std=c11 -O2 -Wall -Wextra -Werror -Igpu/shadps4 tools/gpu_capabilities.c "${libraries[@]}" -o out/ratchet-gpu-capabilities
+if [[ ${1:-} == --test ]]; then
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" -o out/pad-test
+    out/pad-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_runtime.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/runtime-test
+    out/runtime-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_file_mods.c -o out/file-mods-test
+    out/file-mods-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_sema.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sema-test
+    out/sema-test
+    "$CC" -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Werror -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test
+    out/content-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_mp3.c src/runtime_mp3.c out/libatrac9.a -lm "${libraries[@]}" -o out/mp3-test
+    out/mp3-test tests/data/sine.mp3
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_videodec.c "${libraries[@]}" -o out/videodec-test
+    out/videodec-test tests/data/tiny.h264
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_services.c -o out/services-test
+    out/services-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_playgo.c tests/playgo_backends.c src/runtime.c src/runtime_services.c src/runtime_file.c -o out/playgo-resolver-test
+    RATCHET_PLAYGO_TEST="$PWD/out/playgo-resolver-test" python3 -m unittest discover -s tests -p 'test_playgo*.py'
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -mbmi -mlzcnt -mmovbe -I. -Isrc tests/test_isa_emulate.c out/isa_emulate.o -o out/isa-emulate-test
+    out/isa-emulate-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -c src/isa_rewrite.c -I. -Isrc -o out/isa_rewrite.o
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -mbmi -mlzcnt -I. -Isrc tests/test_isa_stub.c out/isa_rewrite.o out/isa_emulate.o -o out/isa-stub-test
+    out/isa-stub-test tests/data/isa_fixture.bin
+fi
